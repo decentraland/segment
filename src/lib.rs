@@ -6,6 +6,7 @@ mod client;
 mod errors;
 mod http;
 pub mod message;
+pub mod queue;
 
 pub use auto_batcher::AutoBatcher;
 pub use batcher::Batcher;
