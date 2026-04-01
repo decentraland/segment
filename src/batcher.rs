@@ -5,8 +5,8 @@ use crate::{Error, Result};
 use serde_json::{Map, Value};
 use time::OffsetDateTime;
 
-const MAX_MESSAGE_SIZE: usize = 1024 * 32;
-const MAX_BATCH_SIZE: usize = 1024 * 500;
+const MAX_MESSAGE_SIZE: usize = 1000 * 32; // Use KB
+const MAX_BATCH_SIZE: usize = 1000 * 500; // Use KB
 
 /// A batcher can accept messages into an internal buffer, and report when
 /// messages must be flushed.
