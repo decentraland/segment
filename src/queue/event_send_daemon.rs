@@ -14,11 +14,14 @@ use crate::{
 const DEFAULT_PROCESS_DELAY_AFTER_ERROR: Duration = Duration::from_millis(200);
 
 #[derive(Error, Debug)]
-enum SendError {
+pub enum SendError {
     #[error("sqlite error: {0}")]
     QueueError(PeekError),
-    #[error("network client error: {0}")]
-    ClientError(crate::Error),
+    #[error("network client error: {segment_error} {item_id}")]
+    ClientError {
+        segment_error: crate::Error,
+        item_id: u64,
+    },
 }
 
 pub struct AnalyticsEventSendDaemon<TClient: Client + Send> {
@@ -45,9 +48,19 @@ impl<TClient: Client + Send + 'static> AnalyticsEventSendDaemon<TClient> {
             loop {
                 let result = Self::send(queue.clone(), client.clone(), write_key.clone()).await;
                 if let Err(e) = result {
-                    error_log_fn(
-                        format!("Error executing send loop (will retry): {:#?}", e).as_str(),
-                    );
+                    let drop_item_id = should_drop(&e);
+
+                    if let Some(drop_item_id) = drop_item_id {
+                        error_log_fn(
+                            format!("Error executing send loop (will drop): {:#?}", e).as_str(),
+                        );
+                        queue.lock().await.consume(drop_item_id);
+                    } else {
+                        error_log_fn(
+                            format!("Error executing send loop (will retry): {:#?}", e).as_str(),
+                        );
+                    }
+
                     sleep(process_delay).await;
                 }
             }
@@ -121,7 +134,10 @@ impl<TClient: Client + Send> AnalyticsEventSendDaemon<TClient> {
                 if let Some(event) = event {
                     let AnalyticsEvent { id, message } = event;
                     if let Err(e) = client.lock().await.send(write_key, message).await {
-                        Err(SendError::ClientError(e))
+                        Err(SendError::ClientError {
+                            segment_error: e,
+                            item_id: id,
+                        })
                     } else {
                         queue.lock().await.consume(id);
                         Ok(())
@@ -139,4 +155,24 @@ impl<TClient: Client + Send> Drop for AnalyticsEventSendDaemon<TClient> {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+// Drop if http response 400
+fn should_drop(error: &SendError) -> Option<u64> {
+    if let SendError::ClientError {
+        segment_error,
+        item_id,
+    } = error
+    {
+        if let crate::Error::NetworkError(network_error) = segment_error {
+            let status = network_error.status();
+            if let Some(status_code) = status {
+                if status_code == reqwest::StatusCode::BAD_REQUEST {
+                    return Some(*item_id);
+                }
+            }
+        }
+    }
+
+    None
 }
