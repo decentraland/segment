@@ -35,7 +35,7 @@ pub struct AnalyticsEventSendDaemon<TClient: Client + Send> {
 impl<TClient: Client + Send + 'static> AnalyticsEventSendDaemon<TClient> {
     pub fn start<EF>(&mut self, error_log_fn: EF)
     where
-        EF: Fn(SendError) + Send + Sync + 'static,
+        EF: Fn(&str) + Send + Sync + 'static,
     {
         self.stop();
 
@@ -48,7 +48,19 @@ impl<TClient: Client + Send + 'static> AnalyticsEventSendDaemon<TClient> {
             loop {
                 let result = Self::send(queue.clone(), client.clone(), write_key.clone()).await;
                 if let Err(e) = result {
-                    error_log_fn(e);
+                    let drop_item_id = should_drop(&e);
+
+                    if let Some(drop_item_id) = drop_item_id {
+                        error_log_fn(
+                            format!("Error executing send loop (will drop): {:#?}", e).as_str(),
+                        );
+                        queue.lock().await.consume(drop_item_id);
+                    } else {
+                        error_log_fn(
+                            format!("Error executing send loop (will retry): {:#?}", e).as_str(),
+                        );
+                    }
+
                     sleep(process_delay).await;
                 }
             }
@@ -143,4 +155,24 @@ impl<TClient: Client + Send> Drop for AnalyticsEventSendDaemon<TClient> {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+// Drop if http response 400
+fn should_drop(error: &SendError) -> Option<u64> {
+    if let SendError::ClientError {
+        segment_error,
+        item_id,
+    } = error
+    {
+        if let crate::Error::NetworkError(network_error) = segment_error {
+            let status = network_error.status();
+            if let Some(status_code) = status {
+                if status_code == reqwest::StatusCode::BAD_REQUEST {
+                    return Some(*item_id);
+                }
+            }
+        }
+    }
+
+    None
 }
