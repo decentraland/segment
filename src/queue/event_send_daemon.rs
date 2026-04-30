@@ -14,11 +14,14 @@ use crate::{
 const DEFAULT_PROCESS_DELAY_AFTER_ERROR: Duration = Duration::from_millis(200);
 
 #[derive(Error, Debug)]
-enum SendError {
+pub enum SendError {
     #[error("sqlite error: {0}")]
     QueueError(PeekError),
-    #[error("network client error: {0}")]
-    ClientError(crate::Error),
+    #[error("network client error: {segment_error} {item_id}")]
+    ClientError {
+        segment_error: crate::Error,
+        item_id: u64,
+    },
 }
 
 pub struct AnalyticsEventSendDaemon<TClient: Client + Send> {
@@ -32,7 +35,7 @@ pub struct AnalyticsEventSendDaemon<TClient: Client + Send> {
 impl<TClient: Client + Send + 'static> AnalyticsEventSendDaemon<TClient> {
     pub fn start<EF>(&mut self, error_log_fn: EF)
     where
-        EF: Fn(&str) + Send + Sync + 'static,
+        EF: Fn(SendError) + Send + Sync + 'static,
     {
         self.stop();
 
@@ -45,9 +48,7 @@ impl<TClient: Client + Send + 'static> AnalyticsEventSendDaemon<TClient> {
             loop {
                 let result = Self::send(queue.clone(), client.clone(), write_key.clone()).await;
                 if let Err(e) = result {
-                    error_log_fn(
-                        format!("Error executing send loop (will retry): {:#?}", e).as_str(),
-                    );
+                    error_log_fn(e);
                     sleep(process_delay).await;
                 }
             }
@@ -121,7 +122,10 @@ impl<TClient: Client + Send> AnalyticsEventSendDaemon<TClient> {
                 if let Some(event) = event {
                     let AnalyticsEvent { id, message } = event;
                     if let Err(e) = client.lock().await.send(write_key, message).await {
-                        Err(SendError::ClientError(e))
+                        Err(SendError::ClientError {
+                            segment_error: e,
+                            item_id: id,
+                        })
                     } else {
                         queue.lock().await.consume(id);
                         Ok(())
