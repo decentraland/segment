@@ -100,6 +100,7 @@ impl Client for HttpClient {
 
             match send_result {
                 Ok(r) => {
+                    let status = r.status();
                     let server_result = r.error_for_status();
 
                     match server_result {
