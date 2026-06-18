@@ -38,12 +38,9 @@ impl HttpClient {
     pub fn new(client: reqwest::Client, host: String) -> HttpClient {
         HttpClient { client, host }
     }
-}
 
-#[async_trait::async_trait]
-impl Client for HttpClient {
-    async fn send(&self, write_key: String, msg: Message) -> Result<()> {
-        let path = match msg {
+    fn subpath_from_msg_type(msg: &Message) -> &'static str {
+        match msg {
             Message::Identify(_) => "/v1/identify",
             Message::Track(_) => "/v1/track",
             Message::Page(_) => "/v1/page",
@@ -51,17 +48,89 @@ impl Client for HttpClient {
             Message::Group(_) => "/v1/group",
             Message::Alias(_) => "/v1/alias",
             Message::Batch(_) => "/v1/batch",
-        };
+        }
+    }
 
-        let _ = self
-            .client
-            .post(format!("{}{}", self.host, path))
+    fn path_from_msg_type(&self, msg: &Message) -> String {
+        let sub_path: &'static str = Self::subpath_from_msg_type(msg);
+        format!("{}{}", self.host, sub_path)
+    }
+
+    fn new_send_request(&self, write_key: &str, msg: &Message) -> reqwest::RequestBuilder {
+        let path: String = self.path_from_msg_type(&msg);
+
+        self.client
+            .post(&path)
             .basic_auth(write_key, Some(""))
             .json(&msg)
-            .send()
-            .await?
-            .error_for_status()?;
+    }
 
-        Ok(())
+    fn backoff_delay(attempt: u8) -> Duration {
+        match attempt {
+            0 => Duration::from_millis(250),
+            1 => Duration::from_millis(500),
+            _ => Duration::from_millis(1000),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Client for HttpClient {
+    async fn send(&self, write_key: String, msg: Message) -> Result<()> {
+        const ATTEMPTS: u8 = 3;
+
+        let mut last_error: Option<reqwest::Error> = None;
+
+        /*
+           Do attempts because sometimes the network channel may break due an ungraceful transport
+           closure:
+
+            source: hyper_util::client::legacy::Error(
+                SendRequest,
+                hyper::Error(
+                    IncompleteMessage,
+                ),
+            ),
+        */
+
+        for i in 0..ATTEMPTS {
+            let request = self.new_send_request(&write_key, &msg);
+            let send_result: std::result::Result<reqwest::Response, reqwest::Error> =
+                request.send().await;
+
+            match send_result {
+                Ok(r) => {
+                    let server_result = r.error_for_status();
+
+                    match server_result {
+                        Ok(_) => return Ok(()),
+                        Err(e) => {
+                            last_error = Some(e);
+
+                            let retryable = status.is_server_error()
+                                || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+                            if !retryable {
+                                break;
+                            }
+
+                            let delay = Self::backoff_delay(i);
+                            tokio::time::sleep(delay).await;
+                            continue;
+                        }
+                    }
+                }
+                Err(e) => {
+                    last_error = Some(e);
+                    let delay = Self::backoff_delay(i);
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+            }
+        }
+
+        match last_error {
+            Some(e) => Err(e.into()),
+            None => unreachable!(),
+        }
     }
 }
