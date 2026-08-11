@@ -104,17 +104,12 @@ impl<TClient: Client + Send> AnalyticsEventSendDaemon<TClient> {
             .unwrap_or_else(Instant::now);
 
         loop {
-            let event = self.queue.lock().await.peek();
+            // A failed read means "not empty yet" and must still reach the
+            // expiry check and the sleep below, so a queue locked by another
+            // process cannot spin this loop.
+            let drained = matches!(self.queue.lock().await.peek(), Ok(None));
 
-            if let Ok(e) = event {
-                if e.is_none() {
-                    break;
-                }
-            } else {
-                continue;
-            }
-
-            if Instant::now() >= expiry {
+            if drained || Instant::now() >= expiry {
                 break;
             }
 
@@ -175,4 +170,84 @@ fn should_drop(error: &SendError) -> Option<u64> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::queue::event_queue::EnqueError;
+    use crate::Message;
+
+    struct UnreadableQueue;
+
+    impl AnalyticsEventQueue for UnreadableQueue {
+        fn enque(&mut self, _msg: Message) -> Result<(), EnqueError> {
+            Ok(())
+        }
+
+        fn peek(&self) -> Result<Option<AnalyticsEvent>, PeekError> {
+            Err(PeekError::Json(
+                serde_json::from_str::<u8>("not a number").unwrap_err(),
+            ))
+        }
+
+        fn consume(&mut self, _id: u64) {}
+    }
+
+    struct EmptyQueue;
+
+    impl AnalyticsEventQueue for EmptyQueue {
+        fn enque(&mut self, _msg: Message) -> Result<(), EnqueError> {
+            Ok(())
+        }
+
+        fn peek(&self) -> Result<Option<AnalyticsEvent>, PeekError> {
+            Ok(None)
+        }
+
+        fn consume(&mut self, _id: u64) {}
+    }
+
+    struct NoopClient;
+
+    #[async_trait::async_trait]
+    impl Client for NoopClient {
+        async fn send(&self, _write_key: String, _msg: Message) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn daemon(
+        queue: impl AnalyticsEventQueue + Send + 'static,
+    ) -> AnalyticsEventSendDaemon<NoopClient> {
+        let queue: Arc<Mutex<dyn AnalyticsEventQueue + Send>> = Arc::new(Mutex::new(queue));
+        AnalyticsEventSendDaemon::new(queue, None, "write-key".to_owned(), NoopClient)
+    }
+
+    /// A queue that cannot be read has to leave through the timeout. A
+    /// regression shows up as a test that never finishes, since the loop it
+    /// guards against has no await point for the harness to cancel.
+    #[tokio::test]
+    async fn unreadable_queue_leaves_through_the_timeout() {
+        let timeout = Duration::from_millis(200);
+        let daemon = daemon(UnreadableQueue);
+
+        let start = Instant::now();
+        daemon.wait_until_empty_queue_or_abandon(Some(timeout)).await;
+        let elapsed = start.elapsed();
+
+        assert!(elapsed >= timeout, "gave up before the timeout: {elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn empty_queue_returns_without_waiting_for_the_timeout() {
+        let timeout = Duration::from_secs(30);
+        let daemon = daemon(EmptyQueue);
+
+        let start = Instant::now();
+        daemon.wait_until_empty_queue_or_abandon(Some(timeout)).await;
+        let elapsed = start.elapsed();
+
+        assert!(elapsed < Duration::from_secs(1), "waited too long: {elapsed:?}");
+    }
 }
