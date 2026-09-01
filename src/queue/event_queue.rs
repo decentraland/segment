@@ -13,11 +13,30 @@ pub enum AnalyticsError {}
 #[derive(Error, Debug)]
 pub enum EnqueError {
     #[error("sqlite error: {0}")]
-    Sqlite(#[from] rusqlite::Error),
+    Sqlite(rusqlite::Error),
+    #[error("disk full: {0}")]
+    DiskFull(rusqlite::Error),
     #[error("serialize json error {0}")]
     Json(#[from] serde_json::Error),
     #[error("limit reached error")]
     LimitReached,
+}
+
+impl EnqueError {
+    pub fn is_disk_full(&self) -> bool {
+        matches!(self, Self::DiskFull(_))
+    }
+}
+
+impl From<rusqlite::Error> for EnqueError {
+    fn from(e: rusqlite::Error) -> Self {
+        // SQLITE_FULL: the "database or disk is full" case Unity must react to
+        if matches!(e.sqlite_error_code(), Some(rusqlite::ErrorCode::DiskFull)) {
+            Self::DiskFull(e)
+        } else {
+            Self::Sqlite(e)
+        }
+    }
 }
 
 #[derive(Error, Debug)]
@@ -233,5 +252,28 @@ impl CombinedAnalyticsEventQueue {
                 e,
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sqlite_failure(code: std::os::raw::c_int) -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None)
+    }
+
+    #[test]
+    fn sqlite_full_classifies_as_disk_full() {
+        let error = EnqueError::from(sqlite_failure(rusqlite::ffi::SQLITE_FULL));
+        assert!(error.is_disk_full());
+        assert!(matches!(error, EnqueError::DiskFull(_)));
+    }
+
+    #[test]
+    fn other_sqlite_errors_stay_generic() {
+        let error = EnqueError::from(sqlite_failure(rusqlite::ffi::SQLITE_BUSY));
+        assert!(!error.is_disk_full());
+        assert!(matches!(error, EnqueError::Sqlite(_)));
     }
 }
