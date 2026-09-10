@@ -28,7 +28,7 @@ rusqlite = { version = "0.37.0", features = ["bundled"] }
 rusqlite = { version = "0.37.0", features = ["bundled"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros"], default-features = false }
+tokio = { version = "1", features = ["rt", "macros", "test-util"], default-features = false }
 
 [features]
 default = ["rustls-tls"]
