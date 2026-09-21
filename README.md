@@ -69,6 +69,16 @@ async fn main() {
 
 ```
 
+## CI
+
+GitHub Actions is disabled for this repository (Settings → Actions → General → Disable actions).
+No workflow has ever run here. The inherited workflows are kept unmodified under
+`.github/workflows-disabled/` for reference; that path is not scanned by GitHub, so
+restoring CI means moving them back to `.github/workflows/` and re-enabling the setting.
+
+Changes are validated by the consumers that build this crate: `unity-explorer`
+(RustSegment native plugin) and `launcher-rust`.
+
 ## License
 
 <sup>
