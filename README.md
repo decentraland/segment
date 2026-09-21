@@ -1,7 +1,6 @@
 # Segment
 
 
-[![Test Status](https://github.com/irevoire/segment/workflows/Rust/badge.svg?event=push)](https://github.com/irevoire/segment/actions)
 [![API](https://docs.rs/segment/badge.svg)](https://docs.rs/segment)
 
 **This crate is an unofficial segment analytics client for Rust used by Meilisearch**
