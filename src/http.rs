@@ -21,7 +21,7 @@ pub const DEFAULT_HOST: &str = "https://api.segment.io";
 
 impl Default for HttpClient {
     fn default() -> Self {
-        HttpClient::with_host(DEFAULT_HOST.to_owned())
+        HttpClient::new_with_host(DEFAULT_HOST.to_owned())
     }
 }
 
@@ -36,13 +36,8 @@ impl HttpClient {
         HttpClient { client, host }
     }
 
-    /// Construct a new `HttpClient` sending to `host`, configured exactly as
-    /// `Default::default` configures its `reqwest::Client`.
-    ///
-    /// `host` is the Tracking API origin and carries no path: the endpoint path
-    /// (`/v1/batch`, `/v1/track`, ...) is appended per message. Use it to route
-    /// events through a Segment Custom Domain.
-    pub fn with_host(host: String) -> HttpClient {
+    /// Construct a new `HttpClient` allowing to override the Segment API host
+    pub fn new_with_host(host: String) -> HttpClient {
         HttpClient {
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::new(10, 0))
