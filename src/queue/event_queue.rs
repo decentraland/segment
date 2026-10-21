@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, path::Path};
+use std::{collections::VecDeque, path::Path, time::Duration};
 
 use rusqlite::{params, Connection};
 use thiserror::Error;
@@ -37,7 +37,7 @@ pub struct AnalyticsEvent {
 pub trait AnalyticsEventQueue {
     fn enque(&mut self, msg: Message) -> Result<(), EnqueError>;
 
-    fn peek(&self) -> Result<Option<AnalyticsEvent>, PeekError>;
+    fn peek(&mut self) -> Result<Option<AnalyticsEvent>, PeekError>;
 
     fn consume(&mut self, id: u64);
 }
@@ -48,21 +48,43 @@ pub struct PersistentAnalyticsEventQueue {
 }
 
 impl PersistentAnalyticsEventQueue {
+    /// Opens the file as its only writer: the lock taken by the first write is kept until the connection closes,
+    /// and a file locked by another connection fails at once with `SQLITE_BUSY` instead of waiting out a timeout.
     pub fn new<P: AsRef<Path>>(path: P, event_count_limit: u32) -> Result<Self, rusqlite::Error> {
-        let conn = Connection::open(path)?; // "Cannot open db"
+        let conn = Connection::open(path)?;
+        conn.busy_timeout(Duration::ZERO)?;
+        conn.pragma_update(None, "locking_mode", "EXCLUSIVE")?;
 
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS analytics_events (
+            "BEGIN IMMEDIATE;
+            CREATE TABLE IF NOT EXISTS analytics_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp DATETIME NOT NULL DEFAULT (DATETIME('now')),
                 message TEXT NOT NULL
-            )",
-        )?; // Cannot create table
+            );
+            COMMIT;",
+        )?;
 
         Ok(Self {
             conn,
             event_count_limit,
         })
+    }
+
+    fn newest_row(&self) -> Result<Option<(u64, String)>, rusqlite::Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, message
+                 FROM analytics_events
+                 ORDER BY timestamp DESC
+                 LIMIT 1",
+        )?;
+
+        let mut rows = stmt.query([])?;
+
+        match rows.next()? {
+            Some(row) => Ok(Some((row.get(0)?, row.get(1)?))),
+            None => Ok(None),
+        }
     }
 }
 
@@ -92,28 +114,18 @@ impl AnalyticsEventQueue for PersistentAnalyticsEventQueue {
         Ok(())
     }
 
-    fn peek(&self) -> Result<Option<AnalyticsEvent>, PeekError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, message 
-                 FROM analytics_events 
-                 ORDER BY timestamp DESC 
-                 LIMIT 1",
-        )?;
+    /// A row that does not deserialize is removed, so the next peek moves past it.
+    fn peek(&mut self) -> Result<Option<AnalyticsEvent>, PeekError> {
+        let Some((id, text)) = self.newest_row()? else {
+            return Ok(None);
+        };
 
-        let mut rows = stmt.query([])?;
-        match rows.next() {
-            Ok(row) => {
-                if let Some(row) = row {
-                    let id: u64 = row.get(0)?;
-                    let text: String = row.get(1)?;
-                    let message: Message = serde_json::from_str(&text)?;
-                    Ok(Some(AnalyticsEvent { id, message }))
-                } else {
-                    Ok(None)
-                }
+        match serde_json::from_str(&text) {
+            Ok(message) => Ok(Some(AnalyticsEvent { id, message })),
+            Err(e) => {
+                self.consume(id);
+                Err(PeekError::Json(e))
             }
-
-            Err(e) => Err(e.into()),
         }
     }
 
@@ -168,7 +180,7 @@ impl AnalyticsEventQueue for InMemoryAnalyticsEventQueue {
         Ok(())
     }
 
-    fn peek(&self) -> Result<Option<AnalyticsEvent>, PeekError> {
+    fn peek(&mut self) -> Result<Option<AnalyticsEvent>, PeekError> {
         Ok(self.events.back().cloned())
     }
 
@@ -192,7 +204,7 @@ impl AnalyticsEventQueue for CombinedAnalyticsEventQueue {
         }
     }
 
-    fn peek(&self) -> Result<Option<AnalyticsEvent>, PeekError> {
+    fn peek(&mut self) -> Result<Option<AnalyticsEvent>, PeekError> {
         match self {
             Self::Persistent(queue) => queue.peek(),
             Self::InMemory(queue) => queue.peek(),
@@ -233,5 +245,89 @@ impl CombinedAnalyticsEventQueue {
                 e,
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message::{Track, User};
+    use rusqlite::ErrorCode;
+
+    fn track() -> Message {
+        Message::Track(Track {
+            user: User::AnonymousId {
+                anonymous_id: "anon".to_owned(),
+            },
+            event: "test".to_owned(),
+            timestamp: Some(time::OffsetDateTime::UNIX_EPOCH),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn a_second_connection_to_the_same_file_is_refused_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.sqlite3");
+        let _owner = PersistentAnalyticsEventQueue::new(&path, 10).unwrap();
+
+        let started = std::time::Instant::now();
+        let error = PersistentAnalyticsEventQueue::new(&path, 10).err().unwrap();
+
+        assert_eq!(error.sqlite_error_code(), Some(ErrorCode::DatabaseBusy));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "waited for a busy timeout: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn the_file_is_free_again_once_the_owner_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.sqlite3");
+        let mut owner = PersistentAnalyticsEventQueue::new(&path, 10).unwrap();
+        owner.enque(track()).unwrap();
+        drop(owner);
+
+        let mut next = PersistentAnalyticsEventQueue::new(&path, 10).unwrap();
+
+        assert!(next.peek().unwrap().is_some());
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_database_is_reported_as_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.sqlite3");
+        std::fs::write(
+            &path,
+            b"this is not a sqlite database at all, just some garbage bytes",
+        )
+        .unwrap();
+
+        let error = PersistentAnalyticsEventQueue::new(&path, 10).err().unwrap();
+
+        assert_eq!(error.sqlite_error_code(), Some(ErrorCode::NotADatabase));
+    }
+
+    #[test]
+    fn an_unreadable_row_is_dropped_on_peek() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.sqlite3");
+        drop(PersistentAnalyticsEventQueue::new(&path, 10).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO analytics_events (message) VALUES (?1)",
+            params!["{ not json"],
+        )
+        .unwrap();
+        drop(conn);
+        let mut queue = PersistentAnalyticsEventQueue::new(&path, 10).unwrap();
+
+        let first = queue.peek();
+        let second = queue.peek();
+
+        assert!(matches!(first, Err(PeekError::Json(_))));
+        assert!(matches!(second, Ok(None)));
     }
 }

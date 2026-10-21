@@ -12,16 +12,60 @@ use crate::{
 };
 
 const DEFAULT_PROCESS_DELAY_AFTER_ERROR: Duration = Duration::from_millis(200);
+const EMPTY_QUEUE_POLL_DELAY: Duration = Duration::from_millis(200);
 
 #[derive(Error, Debug)]
 pub enum SendError {
-    #[error("sqlite error: {0}")]
-    QueueError(PeekError),
-    #[error("network client error: {segment_error} {item_id}")]
-    ClientError {
-        segment_error: crate::Error,
+    /// The row can never be sent and is removed.
+    #[error("message {item_id} can never be sent: {source}")]
+    Dropped { item_id: u64, source: crate::Error },
+    /// The queue removed a row it could not read.
+    #[error("unreadable row removed: {0}")]
+    UnreadableRow(serde_json::Error),
+    /// The API is unreachable; the row stays.
+    #[error("network error for message {item_id}: {source}")]
+    Network {
         item_id: u64,
+        source: reqwest::Error,
     },
+    /// The queue could not be read; the row stays.
+    #[error("sqlite error: {0}")]
+    Queue(rusqlite::Error),
+}
+
+enum SendResult {
+    Sent,
+    QueueEmpty,
+}
+
+/// A delay that doubles on every failure up to a cap and returns to its start on success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RetryBackOff {
+    initial: Duration,
+    current: Duration,
+}
+
+impl RetryBackOff {
+    const MAX: Duration = Duration::from_secs(60);
+
+    const fn new(initial: Duration) -> Self {
+        Self {
+            initial,
+            current: initial,
+        }
+    }
+
+    const fn current(&self) -> Duration {
+        self.current
+    }
+
+    fn grow(&mut self) {
+        self.current = self.current.saturating_mul(2).min(Self::MAX);
+    }
+
+    fn reset(&mut self) {
+        self.current = self.initial;
+    }
 }
 
 pub struct AnalyticsEventSendDaemon<TClient: Client + Send> {
@@ -33,7 +77,7 @@ pub struct AnalyticsEventSendDaemon<TClient: Client + Send> {
 }
 
 impl<TClient: Client + Send + 'static> AnalyticsEventSendDaemon<TClient> {
-    pub fn start<EF>(&mut self, error_log_fn: EF)
+    pub fn start<EF>(&mut self, async_runtime: tokio::runtime::Handle, error_log_fn: EF)
     where
         EF: Fn(&str) + Send + Sync + 'static,
     {
@@ -42,26 +86,43 @@ impl<TClient: Client + Send + 'static> AnalyticsEventSendDaemon<TClient> {
         let client = self.client.clone();
         let queue = self.queue.clone();
         let write_key = self.write_key.clone();
-        let process_delay = self.process_delay;
+        let mut back_off = RetryBackOff::new(self.process_delay);
 
-        let handle = tokio::spawn(async move {
+        let handle = async_runtime.spawn(async move {
             loop {
-                let result = Self::send(queue.clone(), client.clone(), write_key.clone()).await;
-                if let Err(e) = result {
-                    let drop_item_id = should_drop(&e);
-
-                    if let Some(drop_item_id) = drop_item_id {
-                        error_log_fn(
-                            format!("Error executing send loop (will drop): {:#?}", e).as_str(),
-                        );
-                        queue.lock().await.consume(drop_item_id);
-                    } else {
-                        error_log_fn(
-                            format!("Error executing send loop (will retry): {:#?}", e).as_str(),
-                        );
+                match Self::send(queue.clone(), client.clone(), write_key.clone()).await {
+                    Ok(SendResult::Sent) => back_off.reset(),
+                    Ok(SendResult::QueueEmpty) => {
+                        back_off.reset();
+                        sleep(EMPTY_QUEUE_POLL_DELAY).await;
                     }
-
-                    sleep(process_delay).await;
+                    Err(e) => match &e {
+                        SendError::Dropped { item_id, .. } => {
+                            error_log_fn(
+                                format!("Error executing send loop (will drop): {e:#?}").as_str(),
+                            );
+                            queue.lock().await.consume(*item_id);
+                        }
+                        SendError::UnreadableRow(_) => {
+                            error_log_fn(
+                                format!(
+                                    "Error executing send loop (dropped an unreadable row): {e:#?}"
+                                )
+                                .as_str(),
+                            );
+                        }
+                        SendError::Network { .. } => {
+                            sleep(back_off.current()).await;
+                            back_off.grow();
+                        }
+                        SendError::Queue(_) => {
+                            error_log_fn(
+                                format!("Error executing send loop (will retry): {e:#?}").as_str(),
+                            );
+                            sleep(back_off.current()).await;
+                            back_off.grow();
+                        }
+                    },
                 }
             }
         });
@@ -121,27 +182,32 @@ impl<TClient: Client + Send> AnalyticsEventSendDaemon<TClient> {
         queue: Arc<Mutex<dyn AnalyticsEventQueue + Send>>,
         client: Arc<Mutex<TClient>>,
         write_key: String,
-    ) -> std::result::Result<(), SendError> {
-        let event = queue.lock().await.peek();
+    ) -> std::result::Result<SendResult, SendError> {
+        let AnalyticsEvent { id, message } = match queue.lock().await.peek() {
+            Ok(Some(event)) => event,
+            Ok(None) => return Ok(SendResult::QueueEmpty),
+            Err(PeekError::Json(e)) => return Err(SendError::UnreadableRow(e)),
+            Err(PeekError::Sqlite(e)) => return Err(SendError::Queue(e)),
+        };
 
-        match event {
-            Ok(event) => {
-                if let Some(event) = event {
-                    let AnalyticsEvent { id, message } = event;
-                    if let Err(e) = client.lock().await.send(write_key, message).await {
-                        Err(SendError::ClientError {
-                            segment_error: e,
-                            item_id: id,
-                        })
-                    } else {
-                        queue.lock().await.consume(id);
-                        Ok(())
-                    }
-                } else {
-                    Ok(())
-                }
+        match client.lock().await.send(write_key, message).await {
+            Ok(()) => {
+                queue.lock().await.consume(id);
+                Ok(SendResult::Sent)
             }
-            Err(error) => Err(SendError::QueueError(error)),
+            // A 400 answer or a message the API can never take is dropped; any other network answer is retried.
+            Err(crate::Error::NetworkError(source))
+                if source.status() != Some(reqwest::StatusCode::BAD_REQUEST) =>
+            {
+                Err(SendError::Network {
+                    item_id: id,
+                    source,
+                })
+            }
+            Err(source) => Err(SendError::Dropped {
+                item_id: id,
+                source,
+            }),
         }
     }
 }
@@ -152,31 +218,13 @@ impl<TClient: Client + Send> Drop for AnalyticsEventSendDaemon<TClient> {
     }
 }
 
-// Drop if http response 400
-fn should_drop(error: &SendError) -> Option<u64> {
-    if let SendError::ClientError {
-        segment_error,
-        item_id,
-    } = error
-    {
-        if let crate::Error::NetworkError(network_error) = segment_error {
-            let status = network_error.status();
-            if let Some(status_code) = status {
-                if status_code == reqwest::StatusCode::BAD_REQUEST {
-                    return Some(*item_id);
-                }
-            }
-        }
-    }
-
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::queue::event_queue::EnqueError;
+    use crate::message::Track;
+    use crate::queue::event_queue::{EnqueError, InMemoryAnalyticsEventQueue};
     use crate::Message;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct UnreadableQueue;
 
@@ -185,10 +233,8 @@ mod tests {
             Ok(())
         }
 
-        fn peek(&self) -> Result<Option<AnalyticsEvent>, PeekError> {
-            Err(PeekError::Json(
-                serde_json::from_str::<u8>("not a number").unwrap_err(),
-            ))
+        fn peek(&mut self) -> Result<Option<AnalyticsEvent>, PeekError> {
+            Err(PeekError::Sqlite(rusqlite::Error::QueryReturnedNoRows))
         }
 
         fn consume(&mut self, _id: u64) {}
@@ -201,7 +247,22 @@ mod tests {
             Ok(())
         }
 
-        fn peek(&self) -> Result<Option<AnalyticsEvent>, PeekError> {
+        fn peek(&mut self) -> Result<Option<AnalyticsEvent>, PeekError> {
+            Ok(None)
+        }
+
+        fn consume(&mut self, _id: u64) {}
+    }
+
+    struct CountingEmptyQueue(Arc<AtomicUsize>);
+
+    impl AnalyticsEventQueue for CountingEmptyQueue {
+        fn enque(&mut self, _msg: Message) -> Result<(), EnqueError> {
+            Ok(())
+        }
+
+        fn peek(&mut self) -> Result<Option<AnalyticsEvent>, PeekError> {
+            self.0.fetch_add(1, Ordering::Relaxed);
             Ok(None)
         }
 
@@ -217,11 +278,47 @@ mod tests {
         }
     }
 
+    /// Fails every send until `failures_left` is spent, counting the attempts.
+    struct FlakyClient {
+        failures_left: AtomicUsize,
+        attempts: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Client for FlakyClient {
+        async fn send(&self, _write_key: String, _msg: Message) -> crate::Result<()> {
+            self.attempts.fetch_add(1, Ordering::Relaxed);
+
+            if self.failures_left.load(Ordering::Relaxed) == 0 {
+                return Ok(());
+            }
+
+            self.failures_left.fetch_sub(1, Ordering::Relaxed);
+            Err(network_error())
+        }
+    }
+
+    /// A client that fails to build yields a request error with no status, which is what an unreachable API answers with.
+    fn network_error() -> crate::Error {
+        let error = reqwest::Client::builder()
+            .user_agent("\u{0}")
+            .build()
+            .expect_err("an invalid user agent fails the client build");
+        crate::Error::NetworkError(error)
+    }
+
     fn daemon(
         queue: impl AnalyticsEventQueue + Send + 'static,
     ) -> AnalyticsEventSendDaemon<NoopClient> {
         let queue: Arc<Mutex<dyn AnalyticsEventQueue + Send>> = Arc::new(Mutex::new(queue));
         AnalyticsEventSendDaemon::new(queue, None, "write-key".to_owned(), NoopClient)
+    }
+
+    fn track() -> Message {
+        Message::Track(Track {
+            timestamp: Some(time::OffsetDateTime::UNIX_EPOCH),
+            ..Default::default()
+        })
     }
 
     /// A queue that cannot be read has to leave through the timeout. A
@@ -233,10 +330,15 @@ mod tests {
         let daemon = daemon(UnreadableQueue);
 
         let start = Instant::now();
-        daemon.wait_until_empty_queue_or_abandon(Some(timeout)).await;
+        daemon
+            .wait_until_empty_queue_or_abandon(Some(timeout))
+            .await;
         let elapsed = start.elapsed();
 
-        assert!(elapsed >= timeout, "gave up before the timeout: {elapsed:?}");
+        assert!(
+            elapsed >= timeout,
+            "gave up before the timeout: {elapsed:?}"
+        );
     }
 
     #[tokio::test]
@@ -245,9 +347,130 @@ mod tests {
         let daemon = daemon(EmptyQueue);
 
         let start = Instant::now();
-        daemon.wait_until_empty_queue_or_abandon(Some(timeout)).await;
+        daemon
+            .wait_until_empty_queue_or_abandon(Some(timeout))
+            .await;
         let elapsed = start.elapsed();
 
-        assert!(elapsed < Duration::from_secs(1), "waited too long: {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "waited too long: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sender_waits_between_empty_queue_reads() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let mut daemon = daemon(CountingEmptyQueue(reads.clone()));
+        daemon.start(tokio::runtime::Handle::current(), |_| {
+            panic!("Empty queue is not an error")
+        });
+
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            if reads.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+        }
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+
+        tokio::time::advance(EMPTY_QUEUE_POLL_DELAY - Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(reads.load(Ordering::Relaxed), 2);
+
+        daemon.stop();
+    }
+
+    #[test]
+    fn back_off_doubles_up_to_the_cap_and_resets() {
+        let mut back_off = RetryBackOff::new(DEFAULT_PROCESS_DELAY_AFTER_ERROR);
+        let mut seen = Vec::new();
+
+        for _ in 0..12 {
+            seen.push(back_off.current());
+            back_off.grow();
+        }
+        back_off.reset();
+
+        assert_eq!(seen[0], Duration::from_millis(200));
+        assert_eq!(seen[1], Duration::from_millis(400));
+        assert_eq!(seen[2], Duration::from_millis(800));
+        assert_eq!(seen[9], RetryBackOff::MAX);
+        assert_eq!(seen[11], RetryBackOff::MAX);
+        assert_eq!(back_off.current(), DEFAULT_PROCESS_DELAY_AFTER_ERROR);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_network_failure_is_retried_with_back_off_and_is_not_a_fault() {
+        let mut queue = InMemoryAnalyticsEventQueue::new(10);
+        queue.enque(track()).unwrap();
+        let queue: Arc<Mutex<dyn AnalyticsEventQueue + Send>> = Arc::new(Mutex::new(queue));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let client = FlakyClient {
+            failures_left: AtomicUsize::new(3),
+            attempts: attempts.clone(),
+        };
+        let mut daemon =
+            AnalyticsEventSendDaemon::new(queue.clone(), None, "write-key".to_owned(), client);
+        daemon.start(tokio::runtime::Handle::current(), |error| {
+            panic!("a network failure is not a fault: {error}")
+        });
+
+        // Three failures cost 200 + 400 + 800 ms of back-off; the fourth attempt succeeds.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_millis(100)).await;
+        }
+        let attempts_after_one_second = attempts.load(Ordering::Relaxed);
+        for _ in 0..30 {
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_millis(100)).await;
+        }
+
+        assert_eq!(attempts_after_one_second, 3);
+        assert_eq!(attempts.load(Ordering::Relaxed), 4);
+        assert!(queue.lock().await.peek().unwrap().is_none());
+        daemon.stop();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_message_the_api_can_never_take_is_dropped_and_reported() {
+        struct RejectingClient;
+
+        #[async_trait::async_trait]
+        impl Client for RejectingClient {
+            async fn send(&self, _write_key: String, _msg: Message) -> crate::Result<()> {
+                Err(crate::Error::MessageTooLarge)
+            }
+        }
+
+        let mut queue = InMemoryAnalyticsEventQueue::new(10);
+        queue.enque(track()).unwrap();
+        let queue: Arc<Mutex<dyn AnalyticsEventQueue + Send>> = Arc::new(Mutex::new(queue));
+        let faults = Arc::new(AtomicUsize::new(0));
+        let sink = faults.clone();
+        let mut daemon = AnalyticsEventSendDaemon::new(
+            queue.clone(),
+            None,
+            "write-key".to_owned(),
+            RejectingClient,
+        );
+        daemon.start(tokio::runtime::Handle::current(), move |error| {
+            assert!(error.contains("will drop"), "{error}");
+            sink.fetch_add(1, Ordering::Relaxed);
+        });
+
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_millis(100)).await;
+        }
+
+        assert_eq!(faults.load(Ordering::Relaxed), 1);
+        assert!(queue.lock().await.peek().unwrap().is_none());
+        daemon.stop();
     }
 }
