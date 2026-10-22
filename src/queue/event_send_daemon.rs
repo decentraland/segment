@@ -101,7 +101,16 @@ impl<TClient: Client + Send + 'static> AnalyticsEventSendDaemon<TClient> {
                             error_log_fn(
                                 format!("Error executing send loop (will drop): {e:#?}").as_str(),
                             );
-                            queue.lock().await.consume(*item_id);
+
+                            // A row that stays would be peeked again at once; wait as after a failed read.
+                            if let Err(e) = queue.lock().await.consume(*item_id) {
+                                error_log_fn(
+                                    format!("Error executing send loop (cannot drop, will retry): {e:#?}")
+                                        .as_str(),
+                                );
+                                sleep(back_off.current()).await;
+                                back_off.grow();
+                            }
                         }
                         SendError::UnreadableRow(_) => {
                             error_log_fn(
@@ -192,7 +201,7 @@ impl<TClient: Client + Send> AnalyticsEventSendDaemon<TClient> {
 
         match client.lock().await.send(write_key, message).await {
             Ok(()) => {
-                queue.lock().await.consume(id);
+                queue.lock().await.consume(id).map_err(SendError::Queue)?;
                 Ok(SendResult::Sent)
             }
             // A 400 answer or a message the API can never take is dropped; any other network answer is retried.
@@ -237,7 +246,9 @@ mod tests {
             Err(PeekError::Sqlite(rusqlite::Error::QueryReturnedNoRows))
         }
 
-        fn consume(&mut self, _id: u64) {}
+        fn consume(&mut self, _id: u64) -> Result<(), rusqlite::Error> {
+            Ok(())
+        }
     }
 
     struct EmptyQueue;
@@ -251,7 +262,9 @@ mod tests {
             Ok(None)
         }
 
-        fn consume(&mut self, _id: u64) {}
+        fn consume(&mut self, _id: u64) -> Result<(), rusqlite::Error> {
+            Ok(())
+        }
     }
 
     struct CountingEmptyQueue(Arc<AtomicUsize>);
@@ -266,7 +279,32 @@ mod tests {
             Ok(None)
         }
 
-        fn consume(&mut self, _id: u64) {}
+        fn consume(&mut self, _id: u64) -> Result<(), rusqlite::Error> {
+            Ok(())
+        }
+    }
+
+    /// Always holds one row that cannot be removed, as a queue on a full or read-only disk does.
+    struct StuckRowQueue;
+
+    impl AnalyticsEventQueue for StuckRowQueue {
+        fn enque(&mut self, _msg: Message) -> Result<(), EnqueError> {
+            Ok(())
+        }
+
+        fn peek(&mut self) -> Result<Option<AnalyticsEvent>, PeekError> {
+            Ok(Some(AnalyticsEvent {
+                id: 1,
+                message: track(),
+            }))
+        }
+
+        fn consume(&mut self, _id: u64) -> Result<(), rusqlite::Error> {
+            Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+                None,
+            ))
+        }
     }
 
     struct NoopClient;
@@ -434,6 +472,27 @@ mod tests {
         assert_eq!(attempts_after_one_second, 3);
         assert_eq!(attempts.load(Ordering::Relaxed), 4);
         assert!(queue.lock().await.peek().unwrap().is_none());
+        daemon.stop();
+    }
+
+    /// A sent row that stays in the queue is peeked again; the loop must wait between the attempts instead of spinning.
+    #[tokio::test(start_paused = true)]
+    async fn a_row_that_cannot_be_removed_is_retried_with_back_off() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let sink = attempts.clone();
+        let mut daemon = daemon(StuckRowQueue);
+        daemon.start(tokio::runtime::Handle::current(), move |error| {
+            assert!(error.contains("will retry"), "{error}");
+            sink.fetch_add(1, Ordering::Relaxed);
+        });
+
+        // Three failures cost 200 + 400 + 800 ms of back-off, so one second holds three attempts.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_millis(100)).await;
+        }
+
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
         daemon.stop();
     }
 

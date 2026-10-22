@@ -39,7 +39,8 @@ pub trait AnalyticsEventQueue {
 
     fn peek(&mut self) -> Result<Option<AnalyticsEvent>, PeekError>;
 
-    fn consume(&mut self, id: u64);
+    /// Removes the event so the next peek moves past it. `Err` means the event is still there.
+    fn consume(&mut self, id: u64) -> Result<(), rusqlite::Error>;
 }
 
 pub struct PersistentAnalyticsEventQueue {
@@ -114,7 +115,8 @@ impl AnalyticsEventQueue for PersistentAnalyticsEventQueue {
         Ok(())
     }
 
-    /// A row that does not deserialize is removed, so the next peek moves past it.
+    /// A row that does not deserialize is removed, so the next peek moves past it. A row that cannot be removed is
+    /// a sqlite failure, since the next peek would return it again.
     fn peek(&mut self) -> Result<Option<AnalyticsEvent>, PeekError> {
         let Some((id, text)) = self.newest_row()? else {
             return Ok(None);
@@ -123,16 +125,16 @@ impl AnalyticsEventQueue for PersistentAnalyticsEventQueue {
         match serde_json::from_str(&text) {
             Ok(message) => Ok(Some(AnalyticsEvent { id, message })),
             Err(e) => {
-                self.consume(id);
+                self.consume(id)?;
                 Err(PeekError::Json(e))
             }
         }
     }
 
-    fn consume(&mut self, id: u64) {
-        let _ = self
-            .conn
-            .execute("DELETE FROM analytics_events WHERE id = ?1", params![id]);
+    fn consume(&mut self, id: u64) -> Result<(), rusqlite::Error> {
+        self.conn
+            .execute("DELETE FROM analytics_events WHERE id = ?1", params![id])
+            .map(|_| ())
     }
 }
 
@@ -184,10 +186,12 @@ impl AnalyticsEventQueue for InMemoryAnalyticsEventQueue {
         Ok(self.events.back().cloned())
     }
 
-    fn consume(&mut self, id: u64) {
+    fn consume(&mut self, id: u64) -> Result<(), rusqlite::Error> {
         if let Some(pos) = self.events.iter().position(|e| e.id == id) {
             self.events.remove(pos);
         }
+
+        Ok(())
     }
 }
 
@@ -211,14 +215,10 @@ impl AnalyticsEventQueue for CombinedAnalyticsEventQueue {
         }
     }
 
-    fn consume(&mut self, id: u64) {
+    fn consume(&mut self, id: u64) -> Result<(), rusqlite::Error> {
         match self {
-            Self::Persistent(queue) => {
-                queue.consume(id);
-            }
-            Self::InMemory(queue) => {
-                queue.consume(id);
-            }
+            Self::Persistent(queue) => queue.consume(id),
+            Self::InMemory(queue) => queue.consume(id),
         }
     }
 }
