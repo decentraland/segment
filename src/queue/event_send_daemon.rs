@@ -12,6 +12,7 @@ use crate::{
 };
 
 const DEFAULT_PROCESS_DELAY_AFTER_ERROR: Duration = Duration::from_millis(200);
+const EMPTY_QUEUE_POLL_DELAY: Duration = Duration::from_millis(200);
 
 #[derive(Error, Debug)]
 pub enum SendError {
@@ -47,7 +48,9 @@ impl<TClient: Client + Send + 'static> AnalyticsEventSendDaemon<TClient> {
         let handle = tokio::spawn(async move {
             loop {
                 let result = Self::send(queue.clone(), client.clone(), write_key.clone()).await;
-                if let Err(e) = result {
+                if matches!(result, Ok(false)) {
+                    sleep(EMPTY_QUEUE_POLL_DELAY).await;
+                } else if let Err(e) = result {
                     let drop_item_id = should_drop(&e);
 
                     if let Some(drop_item_id) = drop_item_id {
@@ -121,7 +124,7 @@ impl<TClient: Client + Send> AnalyticsEventSendDaemon<TClient> {
         queue: Arc<Mutex<dyn AnalyticsEventQueue + Send>>,
         client: Arc<Mutex<TClient>>,
         write_key: String,
-    ) -> std::result::Result<(), SendError> {
+    ) -> std::result::Result<bool, SendError> {
         let event = queue.lock().await.peek();
 
         match event {
@@ -135,10 +138,10 @@ impl<TClient: Client + Send> AnalyticsEventSendDaemon<TClient> {
                         })
                     } else {
                         queue.lock().await.consume(id);
-                        Ok(())
+                        Ok(true)
                     }
                 } else {
-                    Ok(())
+                    Ok(false)
                 }
             }
             Err(error) => Err(SendError::QueueError(error)),
@@ -192,6 +195,69 @@ mod tests {
         }
 
         fn consume(&mut self, _id: u64) {}
+    }
+
+    struct CountingEmptyQueue(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl AnalyticsEventQueue for CountingEmptyQueue {
+        fn enque(&mut self, _msg: Message) -> Result<(), EnqueError> {
+            Ok(())
+        }
+        fn peek(&self) -> Result<Option<AnalyticsEvent>, PeekError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(None)
+        }
+        fn consume(&mut self, _id: u64) {}
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sender_waits_between_empty_queue_reads() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let reads = Arc::new(AtomicUsize::new(0));
+        let mut daemon = daemon(CountingEmptyQueue(reads.clone()));
+        daemon.start(|_| panic!("Empty queue is not an error"));
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+            if reads.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+        }
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+        tokio::time::advance(EMPTY_QUEUE_POLL_DELAY - Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(reads.load(Ordering::Relaxed), 2);
+        daemon.stop();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sender_drains_events_added_while_idle_without_per_event_delay() {
+        use crate::queue::event_queue::PersistentAnalyticsEventQueue;
+        let queue: Arc<Mutex<dyn AnalyticsEventQueue + Send>> = Arc::new(Mutex::new(
+            PersistentAnalyticsEventQueue::new(":memory:", 10).unwrap(),
+        ));
+        let mut daemon =
+            AnalyticsEventSendDaemon::new(queue.clone(), None, "write-key".to_owned(), NoopClient);
+        daemon.start(|error| panic!("Unexpected send error: {error}"));
+        tokio::task::yield_now().await;
+        for _ in 0..3 {
+            queue
+                .lock()
+                .await
+                .enque(Message::Track(crate::message::Track {
+                    timestamp: Some(time::OffsetDateTime::UNIX_EPOCH),
+                    ..Default::default()
+                }))
+                .unwrap();
+        }
+        let started = tokio::time::Instant::now();
+        tokio::time::advance(Duration::from_millis(200)).await;
+        tokio::task::yield_now().await;
+        assert!(queue.lock().await.peek().unwrap().is_none());
+        assert_eq!(started.elapsed(), Duration::from_millis(200));
+        daemon.stop();
     }
 
     struct EmptyQueue;
