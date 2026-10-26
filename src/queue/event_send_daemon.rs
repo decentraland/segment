@@ -16,28 +16,28 @@ const EMPTY_QUEUE_POLL_DELAY: Duration = Duration::from_millis(200);
 
 #[derive(Error, Debug)]
 pub enum SendError {
-    /// The row can never be sent and is removed.
+    /// The API can never take the message.
     #[error("message {item_id} can never be sent: {source}")]
     Dropped { item_id: u64, source: crate::Error },
     /// The queue removed a row it could not read.
     #[error("unreadable row removed: {0}")]
     UnreadableRow(serde_json::Error),
-    /// The API is unreachable or asks to retry later; the row stays.
+    /// The API is unreachable or asks to retry later.
     #[error("network error for message {item_id}: {source}")]
     Network {
         item_id: u64,
         source: reqwest::Error,
     },
-    /// The API refused the request for a reason that is not the message, such as an invalid write key; the row stays.
+    /// The API refused the request for a reason that is not the message, such as an invalid write key.
     #[error("message {item_id} rejected: {source}")]
     Rejected {
         item_id: u64,
         source: reqwest::Error,
     },
-    /// The queue could not be read; the row stays.
+    /// The queue could not be read.
     #[error("sqlite error: {0}")]
     Queue(rusqlite::Error),
-    /// The row was sent or dropped but could not be removed; it stays and is not sent again.
+    /// The row was sent or dropped but could not be removed.
     #[error("message {item_id} cannot be removed: {source}")]
     Unremoved {
         item_id: u64,
@@ -124,7 +124,7 @@ impl<TClient: Client + Send + 'static> AnalyticsEventSendDaemon<TClient> {
                                 format!("Error executing send loop (will drop): {e:#?}").as_str(),
                             );
 
-                            // A row that stays would be peeked again at once; wait as after a failed read.
+                            // Back off before retrying the removal.
                             if let Err(e) = queue.lock().await.consume(*item_id) {
                                 settled = Some(*item_id);
                                 report_first_of_streak(
@@ -361,7 +361,7 @@ mod tests {
         }
     }
 
-    /// Always holds one row that cannot be removed, as a queue on a full or read-only disk does. Counts the removals.
+    /// Always holds one row that cannot be removed. Counts the removals.
     struct StuckRowQueue(Arc<AtomicUsize>);
 
     impl AnalyticsEventQueue for StuckRowQueue {
@@ -415,7 +415,7 @@ mod tests {
         }
     }
 
-    /// A client that fails to build yields a request error with no status, which is what an unreachable API answers with.
+    /// A client that fails to build yields a request error with no status.
     fn network_error() -> crate::Error {
         let error = reqwest::Client::builder()
             .user_agent("\u{0}")

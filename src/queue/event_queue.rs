@@ -39,7 +39,7 @@ pub trait AnalyticsEventQueue {
 
     fn peek(&mut self) -> Result<Option<AnalyticsEvent>, PeekError>;
 
-    /// Removes the event so the next peek moves past it. `Err` means the event is still there.
+    /// Removes the event. `Err` means the event is still there.
     fn consume(&mut self, id: u64) -> Result<(), rusqlite::Error>;
 }
 
@@ -115,8 +115,8 @@ impl AnalyticsEventQueue for PersistentAnalyticsEventQueue {
         Ok(())
     }
 
-    /// A row that does not deserialize is removed, so the next peek moves past it. A row that cannot be removed is
-    /// a sqlite failure, since the next peek would return it again.
+    /// A row that does not deserialize is removed and reported as `PeekError::Json`, or as the sqlite error if the
+    /// removal fails.
     fn peek(&mut self) -> Result<Option<AnalyticsEvent>, PeekError> {
         let Some((id, text)) = self.newest_row()? else {
             return Ok(None);
