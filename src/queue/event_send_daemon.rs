@@ -22,15 +22,27 @@ pub enum SendError {
     /// The queue removed a row it could not read.
     #[error("unreadable row removed: {0}")]
     UnreadableRow(serde_json::Error),
-    /// The API is unreachable; the row stays.
+    /// The API is unreachable or asks to retry later; the row stays.
     #[error("network error for message {item_id}: {source}")]
     Network {
+        item_id: u64,
+        source: reqwest::Error,
+    },
+    /// The API refused the request for a reason that is not the message, such as an invalid write key; the row stays.
+    #[error("message {item_id} rejected: {source}")]
+    Rejected {
         item_id: u64,
         source: reqwest::Error,
     },
     /// The queue could not be read; the row stays.
     #[error("sqlite error: {0}")]
     Queue(rusqlite::Error),
+    /// The row was sent or dropped but could not be removed; it stays and is not sent again.
+    #[error("message {item_id} cannot be removed: {source}")]
+    Unremoved {
+        item_id: u64,
+        source: rusqlite::Error,
+    },
 }
 
 enum SendResult {
@@ -87,12 +99,22 @@ impl<TClient: Client + Send + 'static> AnalyticsEventSendDaemon<TClient> {
         let queue = self.queue.clone();
         let write_key = self.write_key.clone();
         let mut back_off = RetryBackOff::new(self.process_delay);
+        // A row that was sent or dropped but could not be removed: it is only removed again, never sent again.
+        let mut settled: Option<u64> = None;
+        // A condition that persists across retries is reported once per failure streak.
+        let mut streak_reported = false;
 
         let handle = async_runtime.spawn(async move {
             loop {
-                match Self::send(queue.clone(), client.clone(), write_key.clone()).await {
-                    Ok(SendResult::Sent) => back_off.reset(),
+                match Self::send(queue.clone(), client.clone(), write_key.clone(), settled).await {
+                    Ok(SendResult::Sent) => {
+                        settled = None;
+                        streak_reported = false;
+                        back_off.reset();
+                    }
                     Ok(SendResult::QueueEmpty) => {
+                        settled = None;
+                        streak_reported = false;
                         back_off.reset();
                         sleep(EMPTY_QUEUE_POLL_DELAY).await;
                     }
@@ -104,7 +126,10 @@ impl<TClient: Client + Send + 'static> AnalyticsEventSendDaemon<TClient> {
 
                             // A row that stays would be peeked again at once; wait as after a failed read.
                             if let Err(e) = queue.lock().await.consume(*item_id) {
-                                error_log_fn(
+                                settled = Some(*item_id);
+                                report_first_of_streak(
+                                    &mut streak_reported,
+                                    &error_log_fn,
                                     format!("Error executing send loop (cannot drop, will retry): {e:#?}")
                                         .as_str(),
                                 );
@@ -124,8 +149,23 @@ impl<TClient: Client + Send + 'static> AnalyticsEventSendDaemon<TClient> {
                             sleep(back_off.current()).await;
                             back_off.grow();
                         }
-                        SendError::Queue(_) => {
-                            error_log_fn(
+                        SendError::Rejected { .. } => {
+                            report_first_of_streak(
+                                &mut streak_reported,
+                                &error_log_fn,
+                                format!("Error executing send loop (rejected, will retry): {e:#?}")
+                                    .as_str(),
+                            );
+                            sleep(back_off.current()).await;
+                            back_off.grow();
+                        }
+                        SendError::Queue(_) | SendError::Unremoved { .. } => {
+                            if let SendError::Unremoved { item_id, .. } = &e {
+                                settled = Some(*item_id);
+                            }
+                            report_first_of_streak(
+                                &mut streak_reported,
+                                &error_log_fn,
                                 format!("Error executing send loop (will retry): {e:#?}").as_str(),
                             );
                             sleep(back_off.current()).await;
@@ -137,6 +177,17 @@ impl<TClient: Client + Send + 'static> AnalyticsEventSendDaemon<TClient> {
         });
 
         self.task = Some(handle);
+    }
+}
+
+fn report_first_of_streak<EF: Fn(&str)>(
+    streak_reported: &mut bool,
+    error_log_fn: &EF,
+    message: &str,
+) {
+    if !*streak_reported {
+        *streak_reported = true;
+        error_log_fn(message);
     }
 }
 
@@ -191,6 +242,7 @@ impl<TClient: Client + Send> AnalyticsEventSendDaemon<TClient> {
         queue: Arc<Mutex<dyn AnalyticsEventQueue + Send>>,
         client: Arc<Mutex<TClient>>,
         write_key: String,
+        settled: Option<u64>,
     ) -> std::result::Result<SendResult, SendError> {
         let AnalyticsEvent { id, message } = match queue.lock().await.peek() {
             Ok(Some(event)) => event,
@@ -199,25 +251,50 @@ impl<TClient: Client + Send> AnalyticsEventSendDaemon<TClient> {
             Err(PeekError::Sqlite(e)) => return Err(SendError::Queue(e)),
         };
 
-        match client.lock().await.send(write_key, message).await {
-            Ok(()) => {
-                queue.lock().await.consume(id).map_err(SendError::Queue)?;
-                Ok(SendResult::Sent)
-            }
-            // A 400 answer or a message the API can never take is dropped; any other network answer is retried.
-            Err(crate::Error::NetworkError(source))
-                if source.status() != Some(reqwest::StatusCode::BAD_REQUEST) =>
-            {
-                Err(SendError::Network {
-                    item_id: id,
-                    source,
-                })
-            }
-            Err(source) => Err(SendError::Dropped {
+        if settled != Some(id) {
+            client
+                .lock()
+                .await
+                .send(write_key, message)
+                .await
+                .map_err(|source| classify_send_failure(id, source))?;
+        }
+
+        queue
+            .lock()
+            .await
+            .consume(id)
+            .map_err(|source| SendError::Unremoved {
                 item_id: id,
                 source,
-            }),
+            })?;
+        Ok(SendResult::Sent)
+    }
+}
+
+/// A 400 answer or a message the API can never take is dropped. An answer with no status, a 5xx, 408 or 429 is a
+/// connectivity failure; any other status is a rejection of the request itself.
+fn classify_send_failure(item_id: u64, error: crate::Error) -> SendError {
+    let crate::Error::NetworkError(source) = error else {
+        return SendError::Dropped {
+            item_id,
+            source: error,
+        };
+    };
+
+    match source.status() {
+        Some(reqwest::StatusCode::BAD_REQUEST) => SendError::Dropped {
+            item_id,
+            source: crate::Error::NetworkError(source),
+        },
+        Some(status)
+            if !status.is_server_error()
+                && status != reqwest::StatusCode::REQUEST_TIMEOUT
+                && status != reqwest::StatusCode::TOO_MANY_REQUESTS =>
+        {
+            SendError::Rejected { item_id, source }
         }
+        _ => SendError::Network { item_id, source },
     }
 }
 
@@ -284,8 +361,8 @@ mod tests {
         }
     }
 
-    /// Always holds one row that cannot be removed, as a queue on a full or read-only disk does.
-    struct StuckRowQueue;
+    /// Always holds one row that cannot be removed, as a queue on a full or read-only disk does. Counts the removals.
+    struct StuckRowQueue(Arc<AtomicUsize>);
 
     impl AnalyticsEventQueue for StuckRowQueue {
         fn enque(&mut self, _msg: Message) -> Result<(), EnqueError> {
@@ -300,6 +377,7 @@ mod tests {
         }
 
         fn consume(&mut self, _id: u64) -> Result<(), rusqlite::Error> {
+            self.0.fetch_add(1, Ordering::Relaxed);
             Err(rusqlite::Error::SqliteFailure(
                 rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
                 None,
@@ -316,8 +394,9 @@ mod tests {
         }
     }
 
-    /// Fails every send until `failures_left` is spent, counting the attempts.
+    /// Fails every send with `failure` until `failures_left` is spent, counting the attempts.
     struct FlakyClient {
+        failure: fn() -> crate::Error,
         failures_left: AtomicUsize,
         attempts: Arc<AtomicUsize>,
     }
@@ -332,7 +411,7 @@ mod tests {
             }
 
             self.failures_left.fetch_sub(1, Ordering::Relaxed);
-            Err(network_error())
+            Err((self.failure)())
         }
     }
 
@@ -343,6 +422,20 @@ mod tests {
             .build()
             .expect_err("an invalid user agent fails the client build");
         crate::Error::NetworkError(error)
+    }
+
+    fn status_error(status: u16) -> reqwest::Error {
+        let response = http::Response::builder()
+            .status(status)
+            .body("")
+            .expect("a status and an empty body make a valid response");
+        reqwest::Response::from(response)
+            .error_for_status()
+            .expect_err("the status is an error status")
+    }
+
+    fn unauthorized() -> crate::Error {
+        crate::Error::NetworkError(status_error(401))
     }
 
     fn daemon(
@@ -449,6 +542,7 @@ mod tests {
         let queue: Arc<Mutex<dyn AnalyticsEventQueue + Send>> = Arc::new(Mutex::new(queue));
         let attempts = Arc::new(AtomicUsize::new(0));
         let client = FlakyClient {
+            failure: network_error,
             failures_left: AtomicUsize::new(3),
             attempts: attempts.clone(),
         };
@@ -475,25 +569,99 @@ mod tests {
         daemon.stop();
     }
 
-    /// A sent row that stays in the queue is peeked again; the loop must wait between the attempts instead of spinning.
+    /// A sent row that stays in the queue is peeked again; the loop must wait between the removals instead of spinning,
+    /// never send the row again and report the streak once.
     #[tokio::test(start_paused = true)]
-    async fn a_row_that_cannot_be_removed_is_retried_with_back_off() {
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let sink = attempts.clone();
-        let mut daemon = daemon(StuckRowQueue);
+    async fn a_row_that_cannot_be_removed_is_not_sent_again() {
+        let removals = Arc::new(AtomicUsize::new(0));
+        let sends = Arc::new(AtomicUsize::new(0));
+        let faults = Arc::new(AtomicUsize::new(0));
+        let sink = faults.clone();
+        let queue: Arc<Mutex<dyn AnalyticsEventQueue + Send>> =
+            Arc::new(Mutex::new(StuckRowQueue(removals.clone())));
+        let client = FlakyClient {
+            failure: network_error,
+            failures_left: AtomicUsize::new(0),
+            attempts: sends.clone(),
+        };
+        let mut daemon = AnalyticsEventSendDaemon::new(queue, None, "write-key".to_owned(), client);
         daemon.start(tokio::runtime::Handle::current(), move |error| {
             assert!(error.contains("will retry"), "{error}");
             sink.fetch_add(1, Ordering::Relaxed);
         });
 
-        // Three failures cost 200 + 400 + 800 ms of back-off, so one second holds three attempts.
+        // Three failures cost 200 + 400 + 800 ms of back-off, so one second holds three removals.
         for _ in 0..10 {
             tokio::task::yield_now().await;
             tokio::time::advance(Duration::from_millis(100)).await;
         }
 
-        assert_eq!(attempts.load(Ordering::Relaxed), 3);
+        assert_eq!(removals.load(Ordering::Relaxed), 3);
+        assert_eq!(sends.load(Ordering::Relaxed), 1);
+        assert_eq!(faults.load(Ordering::Relaxed), 1);
         daemon.stop();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_rejected_request_is_retried_and_reported_once_per_streak() {
+        let mut queue = InMemoryAnalyticsEventQueue::new(10);
+        queue.enque(track()).unwrap();
+        let queue: Arc<Mutex<dyn AnalyticsEventQueue + Send>> = Arc::new(Mutex::new(queue));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let faults = Arc::new(AtomicUsize::new(0));
+        let sink = faults.clone();
+        let client = FlakyClient {
+            failure: unauthorized,
+            failures_left: AtomicUsize::new(3),
+            attempts: attempts.clone(),
+        };
+        let mut daemon =
+            AnalyticsEventSendDaemon::new(queue.clone(), None, "write-key".to_owned(), client);
+        daemon.start(tokio::runtime::Handle::current(), move |error| {
+            assert!(error.contains("rejected, will retry"), "{error}");
+            sink.fetch_add(1, Ordering::Relaxed);
+        });
+
+        // Three failures cost 200 + 400 + 800 ms of back-off; the fourth attempt succeeds.
+        for _ in 0..40 {
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_millis(100)).await;
+        }
+
+        assert_eq!(attempts.load(Ordering::Relaxed), 4);
+        assert_eq!(faults.load(Ordering::Relaxed), 1);
+        assert!(queue.lock().await.peek().unwrap().is_none());
+        daemon.stop();
+    }
+
+    #[test]
+    fn send_failures_are_classified_by_status() {
+        for status in [401, 403, 404, 413, 422] {
+            let failure =
+                classify_send_failure(1, crate::Error::NetworkError(status_error(status)));
+            assert!(
+                matches!(failure, SendError::Rejected { .. }),
+                "{status}: {failure:?}"
+            );
+        }
+
+        for status in [408, 429, 500, 503] {
+            let failure =
+                classify_send_failure(1, crate::Error::NetworkError(status_error(status)));
+            assert!(
+                matches!(failure, SendError::Network { .. }),
+                "{status}: {failure:?}"
+            );
+        }
+
+        let failure = classify_send_failure(1, crate::Error::NetworkError(status_error(400)));
+        assert!(matches!(failure, SendError::Dropped { .. }), "{failure:?}");
+
+        let failure = classify_send_failure(1, network_error());
+        assert!(matches!(failure, SendError::Network { .. }), "{failure:?}");
+
+        let failure = classify_send_failure(1, crate::Error::MessageTooLarge);
+        assert!(matches!(failure, SendError::Dropped { .. }), "{failure:?}");
     }
 
     #[tokio::test(start_paused = true)]
