@@ -24,6 +24,14 @@ pub enum SendError {
     },
 }
 
+/// A failed send and what the daemon does with the event next.
+pub enum SendFailure<'a> {
+    /// The event stays in the queue and is sent again after the process delay.
+    WillRetry(&'a SendError),
+    /// The event is removed from the queue and never sent.
+    WillDrop(&'a SendError),
+}
+
 pub struct AnalyticsEventSendDaemon<TClient: Client + Send> {
     queue: Arc<Mutex<dyn AnalyticsEventQueue + Send>>,
     process_delay: Duration,
@@ -33,9 +41,9 @@ pub struct AnalyticsEventSendDaemon<TClient: Client + Send> {
 }
 
 impl<TClient: Client + Send + 'static> AnalyticsEventSendDaemon<TClient> {
-    pub fn start<EF>(&mut self, error_log_fn: EF)
+    pub fn start<EF>(&mut self, on_failure: EF)
     where
-        EF: Fn(&str) + Send + Sync + 'static,
+        EF: Fn(SendFailure<'_>) + Send + Sync + 'static,
     {
         self.stop();
 
@@ -51,14 +59,10 @@ impl<TClient: Client + Send + 'static> AnalyticsEventSendDaemon<TClient> {
                     let drop_item_id = should_drop(&e);
 
                     if let Some(drop_item_id) = drop_item_id {
-                        error_log_fn(
-                            format!("Error executing send loop (will drop): {:#?}", e).as_str(),
-                        );
+                        on_failure(SendFailure::WillDrop(&e));
                         queue.lock().await.consume(drop_item_id);
                     } else {
-                        error_log_fn(
-                            format!("Error executing send loop (will retry): {:#?}", e).as_str(),
-                        );
+                        on_failure(SendFailure::WillRetry(&e));
                     }
 
                     sleep(process_delay).await;
