@@ -283,7 +283,11 @@ fn classify_send_failure(item_id: u64, error: crate::Error) -> SendError {
     };
 
     match source.status() {
-        Some(reqwest::StatusCode::BAD_REQUEST) => SendError::Dropped {
+        Some(
+            reqwest::StatusCode::BAD_REQUEST
+            | reqwest::StatusCode::PAYLOAD_TOO_LARGE
+            | reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        ) => SendError::Dropped {
             item_id,
             source: crate::Error::NetworkError(source),
         },
@@ -636,7 +640,7 @@ mod tests {
 
     #[test]
     fn send_failures_are_classified_by_status() {
-        for status in [401, 403, 404, 413, 422] {
+        for status in [401, 403, 404] {
             let failure =
                 classify_send_failure(1, crate::Error::NetworkError(status_error(status)));
             assert!(
@@ -654,8 +658,14 @@ mod tests {
             );
         }
 
-        let failure = classify_send_failure(1, crate::Error::NetworkError(status_error(400)));
-        assert!(matches!(failure, SendError::Dropped { .. }), "{failure:?}");
+        for status in [400, 413, 422] {
+            let failure =
+                classify_send_failure(1, crate::Error::NetworkError(status_error(status)));
+            assert!(
+                matches!(failure, SendError::Dropped { .. }),
+                "{status}: {failure:?}"
+            );
+        }
 
         let failure = classify_send_failure(1, network_error());
         assert!(matches!(failure, SendError::Network { .. }), "{failure:?}");
