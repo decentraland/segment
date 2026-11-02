@@ -68,6 +68,18 @@ async fn main() {
 
 ```
 
+## Persistent queue
+
+`queue::event_queue::PersistentAnalyticsEventQueue` keeps events in a SQLite file with one writer at a time: the file is
+opened in exclusive locking mode with no busy timeout, so the first write holds the file lock until the connection closes
+and any other connection fails at once with `SQLITE_BUSY` instead of waiting out a timeout. A row whose JSON does not
+deserialize is removed on `peek`, so the queue moves past it. What to do with a locked, corrupt or unwritable file is left
+to the consumer, which sees the `rusqlite::Error`.
+
+`queue::event_send_daemon::AnalyticsEventSendDaemon` retries a failed send with a delay that doubles up to 60 s and
+retries a network failure silently. The string error callback given to `start` receives genuine
+faults only: a row that was dropped because the API can never take it, or because it could not be read.
+
 ## CI
 
 GitHub Actions is disabled for this repository (Settings → Actions → General → Disable actions).
