@@ -80,6 +80,14 @@ impl RetryBackOff {
     }
 }
 
+/// A failed send and what the daemon does with the event next.
+pub enum SendFailure<'a> {
+    /// The event stays in the queue and is sent again after a back-off.
+    WillRetry(&'a SendError),
+    /// The event is removed from the queue and never sent.
+    WillDrop(&'a SendError),
+}
+
 pub struct AnalyticsEventSendDaemon<TClient: Client + Send> {
     queue: Arc<Mutex<dyn AnalyticsEventQueue + Send>>,
     process_delay: Duration,
@@ -89,9 +97,9 @@ pub struct AnalyticsEventSendDaemon<TClient: Client + Send> {
 }
 
 impl<TClient: Client + Send + 'static> AnalyticsEventSendDaemon<TClient> {
-    pub fn start<EF>(&mut self, async_runtime: tokio::runtime::Handle, error_log_fn: EF)
+    pub fn start<EF>(&mut self, async_runtime: tokio::runtime::Handle, on_failure: EF)
     where
-        EF: Fn(&str) + Send + Sync + 'static,
+        EF: Fn(SendFailure<'_>) + Send + Sync + 'static,
     {
         self.stop();
 
@@ -120,30 +128,26 @@ impl<TClient: Client + Send + 'static> AnalyticsEventSendDaemon<TClient> {
                     }
                     Err(e) => match &e {
                         SendError::Dropped { item_id, .. } => {
-                            error_log_fn(
-                                format!("Error executing send loop (will drop): {e:#?}").as_str(),
-                            );
+                            on_failure(SendFailure::WillDrop(&e));
 
                             // Back off before retrying the removal.
-                            if let Err(e) = queue.lock().await.consume(*item_id) {
+                            if let Err(source) = queue.lock().await.consume(*item_id) {
                                 settled = Some(*item_id);
+                                let unremoved = SendError::Unremoved {
+                                    item_id: *item_id,
+                                    source,
+                                };
                                 report_first_of_streak(
                                     &mut streak_reported,
-                                    &error_log_fn,
-                                    format!("Error executing send loop (cannot drop, will retry): {e:#?}")
-                                        .as_str(),
+                                    &on_failure,
+                                    SendFailure::WillRetry(&unremoved),
                                 );
                                 sleep(back_off.current()).await;
                                 back_off.grow();
                             }
                         }
                         SendError::UnreadableRow(_) => {
-                            error_log_fn(
-                                format!(
-                                    "Error executing send loop (dropped an unreadable row): {e:#?}"
-                                )
-                                .as_str(),
-                            );
+                            on_failure(SendFailure::WillDrop(&e));
                         }
                         SendError::Network { .. } => {
                             sleep(back_off.current()).await;
@@ -152,9 +156,8 @@ impl<TClient: Client + Send + 'static> AnalyticsEventSendDaemon<TClient> {
                         SendError::Rejected { .. } => {
                             report_first_of_streak(
                                 &mut streak_reported,
-                                &error_log_fn,
-                                format!("Error executing send loop (rejected, will retry): {e:#?}")
-                                    .as_str(),
+                                &on_failure,
+                                SendFailure::WillRetry(&e),
                             );
                             sleep(back_off.current()).await;
                             back_off.grow();
@@ -165,8 +168,8 @@ impl<TClient: Client + Send + 'static> AnalyticsEventSendDaemon<TClient> {
                             }
                             report_first_of_streak(
                                 &mut streak_reported,
-                                &error_log_fn,
-                                format!("Error executing send loop (will retry): {e:#?}").as_str(),
+                                &on_failure,
+                                SendFailure::WillRetry(&e),
                             );
                             sleep(back_off.current()).await;
                             back_off.grow();
@@ -180,14 +183,14 @@ impl<TClient: Client + Send + 'static> AnalyticsEventSendDaemon<TClient> {
     }
 }
 
-fn report_first_of_streak<EF: Fn(&str)>(
+fn report_first_of_streak<EF: Fn(SendFailure<'_>)>(
     streak_reported: &mut bool,
-    error_log_fn: &EF,
-    message: &str,
+    on_failure: &EF,
+    failure: SendFailure<'_>,
 ) {
     if !*streak_reported {
         *streak_reported = true;
-        error_log_fn(message);
+        on_failure(failure);
     }
 }
 
@@ -552,8 +555,8 @@ mod tests {
         };
         let mut daemon =
             AnalyticsEventSendDaemon::new(queue.clone(), None, "write-key".to_owned(), client);
-        daemon.start(tokio::runtime::Handle::current(), |error| {
-            panic!("a network failure is not a fault: {error}")
+        daemon.start(tokio::runtime::Handle::current(), |failure| {
+            panic!("a network failure is not a fault")
         });
 
         // Three failures cost 200 + 400 + 800 ms of back-off; the fourth attempt succeeds.
@@ -589,8 +592,11 @@ mod tests {
             attempts: sends.clone(),
         };
         let mut daemon = AnalyticsEventSendDaemon::new(queue, None, "write-key".to_owned(), client);
-        daemon.start(tokio::runtime::Handle::current(), move |error| {
-            assert!(error.contains("will retry"), "{error}");
+        daemon.start(tokio::runtime::Handle::current(), move |failure| {
+            assert!(matches!(
+                failure,
+                SendFailure::WillRetry(SendError::Unremoved { .. })
+            ));
             sink.fetch_add(1, Ordering::Relaxed);
         });
 
@@ -621,8 +627,11 @@ mod tests {
         };
         let mut daemon =
             AnalyticsEventSendDaemon::new(queue.clone(), None, "write-key".to_owned(), client);
-        daemon.start(tokio::runtime::Handle::current(), move |error| {
-            assert!(error.contains("rejected, will retry"), "{error}");
+        daemon.start(tokio::runtime::Handle::current(), move |failure| {
+            assert!(matches!(
+                failure,
+                SendFailure::WillRetry(SendError::Rejected { .. })
+            ));
             sink.fetch_add(1, Ordering::Relaxed);
         });
 
@@ -696,8 +705,11 @@ mod tests {
             "write-key".to_owned(),
             RejectingClient,
         );
-        daemon.start(tokio::runtime::Handle::current(), move |error| {
-            assert!(error.contains("will drop"), "{error}");
+        daemon.start(tokio::runtime::Handle::current(), move |failure| {
+            assert!(matches!(
+                failure,
+                SendFailure::WillDrop(SendError::Dropped { .. })
+            ));
             sink.fetch_add(1, Ordering::Relaxed);
         });
 
