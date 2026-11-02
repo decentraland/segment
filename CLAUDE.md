@@ -1,0 +1,2 @@
+AntiPatterns
+* **Comments that narrate caller/external behavior.** A comment must state only what the annotated code itself does or guarantees ("remove the corrupt file so the next read doesn't hit it"), never what callers or upper layers will do with the result ("so callers treat it as a miss and re-download"). External behavior can change without this code changing, silently turning the comment into a lie.
